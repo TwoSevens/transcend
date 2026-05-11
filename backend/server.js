@@ -27,7 +27,6 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const distPath = path.join(__dirname, '../frontend/dist');
 if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));
-    // Express 5 routing — use middleware for the SPA fallback.
     app.use((req, res, next) => {
         if (req.method !== 'GET') return next();
         res.sendFile(path.join(distPath, 'index.html'));
@@ -36,7 +35,6 @@ if (fs.existsSync(distPath)) {
 
 const translator = new deepl.Translator(DEEPL_KEY || 'missing');
 
-// DeepL accepts these target codes; map the simple UI codes to DeepL's expected form.
 const DEEPL_TARGET = {
     EN: 'en-US',
     PT: 'pt-PT',
@@ -55,16 +53,30 @@ function resolveTarget(code) {
     return DEEPL_TARGET[code.toUpperCase()] || code.toLowerCase();
 }
 
-async function transcribe(buffer) {
+/**
+ * Returns true when the accumulated text ends with sentence-terminating
+ * punctuation, optionally followed by closing quotes/brackets.
+ * This is the trigger for immediate translation — no need to wait for the
+ * client's 2-second silence timer.
+ */
+function hasSentenceEnd(text) {
+    return /[.!?]['")\]]*\s*$/.test(text.trim());
+}
+
+/**
+ * Transcribe an audio buffer via Groq Whisper.
+ * `prompt` is the tail of the accumulated transcript — it seeds Whisper's
+ * decoder so it doesn't hallucinate or break on short mid-sentence chunks.
+ */
+async function transcribe(buffer, prompt = '') {
     const form = new FormData();
-    form.append('file', new Blob([buffer], { type: 'audio/webm' }), 'audio.webm');
+    form.append('file', new Blob([buffer], { type: 'audio/wav' }), 'audio.wav');
     form.append('model', WHISPER_MODEL);
+    if (prompt) form.append('prompt', prompt.slice(-500));
 
     const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
         method: 'POST',
-        headers: {
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-        },
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
         body: form,
     });
 
@@ -73,8 +85,7 @@ async function transcribe(buffer) {
         throw new Error(`Groq API error ${response.status}: ${err}`);
     }
 
-    const result = await response.json();
-    return (result.text || '').trim();
+    return ((await response.json()).text || '').trim();
 }
 
 async function translate(text, target) {
@@ -83,37 +94,100 @@ async function translate(text, target) {
     return result.text;
 }
 
+// ─── Socket handlers ─────────────────────────────────────────────────────────
+
 io.on('connection', (socket) => {
     console.log('client connected:', socket.id);
 
+    /**
+     * audio_chunk
+     *
+     * Two-phase pipeline:
+     *
+     * Phase 1 — Transcription (fast, ~1-2 s):
+     *   Whisper returns the new chunk text. We emit `transcription_result`
+     *   immediately so the client can render it in the left panel right away,
+     *   shown dimmed since there's no translation yet.
+     *
+     * Phase 2 — Translation (triggered by sentence boundary):
+     *   If the accumulated text ends with . ! or ?, we translate the full
+     *   sentence and emit `translation_result`. The client uses this to fill
+     *   the right panel and bring the left panel to full opacity.
+     *   Sentences without terminal punctuation are handled by `finalize_segment`.
+     */
     socket.on('audio_chunk', async (payload) => {
         try {
-            const { audio, targetLang } = payload || {};
+            const {
+                audio,
+                targetLang,
+                fullTranscript = '', // everything transcribed for this segment so far
+                prompt = '',         // last ~30 words for Whisper context
+                segmentId,
+            } = payload || {};
+
             if (!audio) return;
 
-            // socket.io delivers ArrayBuffer; coerce to Node Buffer.
-            const buffer = Buffer.isBuffer(audio)
-                ? audio
-                : Buffer.from(audio);
+            const buffer = Buffer.isBuffer(audio) ? audio : Buffer.from(audio);
+            if (buffer.length < 1024) return;
 
-            if (buffer.length < 1024) return; // skip empty/near-silent chunks
+            // ── Phase 1 ──────────────────────────────────────────────────────
+            const chunkTranscript = await transcribe(buffer, prompt || fullTranscript);
+            if (!chunkTranscript) return;
 
-            const transcript = await transcribe(buffer);
-            if (!transcript) return;
+            const combined = fullTranscript
+                ? `${fullTranscript} ${chunkTranscript}`.trim()
+                : chunkTranscript;
+
+            const sentenceComplete = hasSentenceEnd(combined);
+
+            // Emit transcript immediately — client shows it dimmed.
+            socket.emit('transcription_result', {
+                transcript: chunkTranscript,
+                segmentId,
+                sentenceComplete, // client seals the segment & opens new line if true
+            });
+
+            // ── Phase 2 ──────────────────────────────────────────────────────
+            if (sentenceComplete) {
+                const target = resolveTarget(targetLang);
+                let translation = '';
+                try {
+                    translation = await translate(combined, target);
+                } catch (err) {
+                    console.error('translate error:', err.message);
+                    translation = '(translation failed)';
+                }
+                socket.emit('translation_result', { translation, segmentId });
+            }
+        } catch (err) {
+            console.error('processing error:', err.message);
+            socket.emit('transcription_error', { message: err.message || 'processing failed' });
+        }
+    });
+
+    /**
+     * finalize_segment
+     *
+     * The client fires this when its 2-second silence timer expires and the
+     * active segment still has no translation (speaker trailed off without a
+     * period / question mark).  We translate whatever text we're given.
+     */
+    socket.on('finalize_segment', async (payload) => {
+        try {
+            const { segmentId, fullTranscript, targetLang } = payload || {};
+            if (!segmentId || !fullTranscript) return;
 
             const target = resolveTarget(targetLang);
             let translation = '';
             try {
-                translation = await translate(transcript, target);
+                translation = await translate(fullTranscript, target);
             } catch (err) {
-                console.error('translate error:', err.message);
+                console.error('finalize translate error:', err.message);
                 translation = '(translation failed)';
             }
-
-            socket.emit('transcription_result', { transcript, translation });
+            socket.emit('translation_result', { translation, segmentId });
         } catch (err) {
-            console.error('processing error:', err.message);
-            socket.emit('transcription_error', { message: err.message || 'processing failed' });
+            console.error('finalize error:', err.message);
         }
     });
 
