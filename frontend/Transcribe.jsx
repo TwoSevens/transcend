@@ -1,250 +1,242 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
+import { useMicVAD, utils } from "@ricky0123/vad-react";
 import socket from './socket';
 import { LANGUAGES } from './languages';
 
-const CHUNK_MS = 3000;
-
-function timestamp() {
-  return new Date().toLocaleTimeString('en-GB', {
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
+const getTimestamp = () =>
+  new Date().toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
   });
-}
 
 export default function Transcribe({ onBack }) {
-  const [recording, setRecording] = useState(false);
   const [segments, setSegments] = useState([]);
   const [status, setStatus] = useState('idle');
-  const [connected, setConnected] = useState(socket.connected);
-  const [error, setError] = useState('');
-  const [targetLang, setTargetLang] = useState('AR');
-  const [bars, setBars] = useState(Array(10).fill(3));
 
-  const recorderRef = useRef(null);
-  const streamRef = useRef(null);
-  const timerRef = useRef(null);
-  const waveRef = useRef(null);
-  const transcriptEnd = useRef(null);
-  const translationEnd = useRef(null);
-  const idRef = useRef(0);
-  const targetLangRef = useRef(targetLang);
+  const targetLangRef = useRef('AR');
 
-  // Keep ref in sync so the recorder callback always sees the current language.
-  useEffect(() => { targetLangRef.current = targetLang; }, [targetLang]);
+  // Buffer consecutive speech chunks
+  const speechBufferRef = useRef([]);
+  const silenceTimeoutRef = useRef(null);
 
-  const stopWave = useCallback(() => {
-    clearInterval(waveRef.current);
-    setBars(Array(10).fill(3));
-  }, []);
+  const sendBufferedAudio = () => {
+    if (speechBufferRef.current.length === 0) return;
 
-  const stopRecording = useCallback(() => {
-    clearInterval(timerRef.current);
-    try { recorderRef.current?.stop(); } catch { /* already stopped */ }
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    setRecording(false);
+    setStatus('transcribing sentence...');
+
+    // Merge Float32Arrays
+    const totalLength = speechBufferRef.current.reduce(
+      (sum, chunk) => sum + chunk.length,
+      0
+    );
+
+    const merged = new Float32Array(totalLength);
+
+    let offset = 0;
+
+    for (const chunk of speechBufferRef.current) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    speechBufferRef.current = [];
+
+    const wavBuffer = utils.encodeWAV(merged);
+
+    socket.emit('audio_chunk', {
+      audio: wavBuffer,
+      mimeType: 'audio/wav',
+      targetLang: targetLangRef.current,
+    });
+  };
+
+  // Initialize the VAD hook
+  const vad = useMicVAD({
+    onnxWASMBasePath:
+      "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
+
+    baseAssetPath:
+      "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/",
+
+    startOnRealize: false,
+
+    // Make VAD less aggressive
+    positiveSpeechThreshold: 0.6,
+    negativeSpeechThreshold: 0.35,
+    redemptionFrames: 12,
+    preSpeechPadFrames: 8,
+    minSpeechFrames: 3,
+
+    onSpeechStart: () => {
+      setStatus('listening...');
+    },
+
+    onSpeechEnd: (audio) => {
+      setStatus('detecting sentence end...');
+
+      // Store chunk
+      speechBufferRef.current.push(audio);
+
+      // Reset silence timer
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current);
+      }
+
+      // Wait for possible continuation
+      silenceTimeoutRef.current = setTimeout(() => {
+        sendBufferedAudio();
+      }, 1400);
+    },
+
+    onVADMisfire: () => {
+      setStatus('waiting for speech...');
+    }
+  });
+
+  const startTranscription = () => {
+    vad.start();
+    setStatus('waiting for speech...');
+  };
+
+  const stopTranscription = () => {
+    vad.pause();
+
+    // Flush remaining speech
+    if (silenceTimeoutRef.current) {
+      clearTimeout(silenceTimeoutRef.current);
+    }
+
+    sendBufferedAudio();
+
     setStatus('idle');
-    stopWave();
-  }, [stopWave]);
+  };
 
-  /* ── socket events ── */
+  /* ── Socket & Cleanup ── */
+
   useEffect(() => {
-    const onConnect    = () => { setConnected(true);  setError(''); };
-    const onDisconnect = () => { setConnected(false); stopRecording(); };
-    const onConnectErr = () => setError('Backend unreachable — is the server running?');
     const onResult = ({ transcript, translation }) => {
-      idRef.current += 1;
-      setSegments(prev => [...prev, {
-        id: idRef.current,
-        transcript: transcript || '—',
-        translation: translation || '—',
-        time: timestamp(),
-      }]);
-      setStatus('recording');
+      setSegments(prev => [
+        ...prev,
+        {
+          id: Date.now(),
+          transcript,
+          translation,
+          time: getTimestamp(),
+        }
+      ]);
+
+      setStatus('waiting for speech...');
     };
-    const onError = ({ message }) => setError(message);
 
-    socket.on('connect', onConnect);
-    socket.on('disconnect', onDisconnect);
-    socket.on('connect_error', onConnectErr);
     socket.on('transcription_result', onResult);
-    socket.on('transcription_error', onError);
-
-    if (socket.connected) setConnected(true);
 
     return () => {
-      socket.off('connect', onConnect);
-      socket.off('disconnect', onDisconnect);
-      socket.off('connect_error', onConnectErr);
       socket.off('transcription_result', onResult);
-      socket.off('transcription_error', onError);
+
+      if (silenceTimeoutRef.current) {
+        clearTimeout(silenceTimeoutRef.current);
+      }
     };
-  }, [stopRecording]);
-
-  /* ── auto-scroll ── */
-  useEffect(() => {
-    transcriptEnd.current?.scrollIntoView({ behavior: 'smooth' });
-    translationEnd.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [segments]);
-
-  /* ── cleanup on unmount ── */
-  useEffect(() => () => stopRecording(), [stopRecording]);
-
-  /* ── waveform ── */
-  const startWave = () => {
-    waveRef.current = setInterval(() => {
-      setBars(Array(10).fill(0).map(() => Math.floor(3 + Math.random() * 22)));
-    }, 110);
-  };
-
-  /* ── send blob to server ── */
-  const sendChunk = useCallback(async (blob) => {
-    if (!blob || blob.size === 0) return;
-    setStatus('processing…');
-    try {
-      const buffer = await blob.arrayBuffer();
-      socket.emit('audio_chunk', {
-        audio: buffer,
-        mimeType: blob.type,
-        targetLang: targetLangRef.current,
-      });
-    } catch (err) {
-      setError('Failed to send audio chunk.');
-    }
   }, []);
-
-  /* ── start ── */
-  const startRecording = async () => {
-    setError('');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-
-      const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm';
-
-      const recorder = new MediaRecorder(stream, { mimeType: mime });
-      recorderRef.current = recorder;
-
-      recorder.ondataavailable = (e) => sendChunk(e.data);
-      recorder.start();
-
-      timerRef.current = setInterval(() => {
-        if (recorder.state === 'recording') {
-          recorder.stop();
-          recorder.start();
-        }
-      }, CHUNK_MS);
-
-      setRecording(true);
-      setStatus('recording');
-      startWave();
-    } catch {
-      setError('Microphone access denied.');
-    }
-  };
-
-  const clearAll = () => {
-    stopRecording();
-    setSegments([]);
-    idRef.current = 0;
-    setError('');
-  };
-
-  const targetLabel = LANGUAGES.find(l => l.code === targetLang)?.label || targetLang;
 
   return (
     <div className="app">
       <header className="header">
-        <button className="logo logo-btn" onClick={onBack} aria-label="back to home">
-          <div className="logo-mark">
-            <svg viewBox="0 0 16 16" fill="none"><path d="M3 8 Q8 2 13 8 Q8 14 3 8Z" fill="white"/></svg>
-          </div>
-          <span className="logo-name">TRAN<span>SCEND</span></span>
+        <button className="logo logo-btn" onClick={onBack}>
+          <span className="logo-name">
+            TRAN<span>SCEND</span>
+          </span>
         </button>
 
-        <div className="lang-controls">
-          <span className="lang-label">translate to</span>
-          <select
-            className="lang-select"
-            value={targetLang}
-            onChange={e => setTargetLang(e.target.value)}
-          >
-            {LANGUAGES.map(l => (
-              <option key={l.code} value={l.code}>{l.code} — {l.label}</option>
-            ))}
-          </select>
-        </div>
+        <select
+          className="lang-select"
+          onChange={(e) => (targetLangRef.current = e.target.value)}
+        >
+          {LANGUAGES.map((l) => (
+            <option key={l.code} value={l.code}>
+              {l.label}
+            </option>
+          ))}
+        </select>
       </header>
-
-      {error && <div className="error-bar">{error}</div>}
 
       <main className="panels">
         <div className="panel">
-          <div className="panel-header">
-            <span className="panel-label">Transcript</span>
-            <span className="lang-badge">auto</span>
-          </div>
+          <div className="panel-header">Transcript</div>
+
           <div className="panel-scroll">
-            {segments.length === 0
-              ? <p className="empty">waiting for audio…</p>
-              : segments.map(s => (
-                <div className="segment" key={s.id}>
-                  <span className="seg-time">{s.time} <em>#{s.id}</em></span>
-                  <p className="seg-text">{s.transcript}</p>
-                </div>
-              ))
-            }
-            <div ref={transcriptEnd} />
+            {segments.map((s) => (
+              <div className="segment" key={s.id}>
+                <span className="seg-time">{s.time}</span>
+                <p>{s.transcript}</p>
+              </div>
+            ))}
           </div>
         </div>
 
         <div className="panel">
-          <div className="panel-header">
-            <span className="panel-label">Translation</span>
-            <span className="lang-badge translated" title={targetLabel}>{targetLang}</span>
-          </div>
+          <div className="panel-header">Translation</div>
+
           <div className="panel-scroll">
-            {segments.length === 0
-              ? <p className="empty">waiting for audio…</p>
-              : segments.map(s => (
-                <div className="segment" key={s.id}>
-                  <span className="seg-time">{s.time} <em>#{s.id}</em></span>
-                  <p className="seg-text">{s.translation}</p>
-                </div>
-              ))
-            }
-            <div ref={translationEnd} />
+            {segments.map((s) => (
+              <div className="segment" key={s.id}>
+                <span className="seg-time">{s.time}</span>
+                <p>{s.translation}</p>
+              </div>
+            ))}
           </div>
         </div>
       </main>
 
       <footer className="footer">
         <div className="footer-left">
-          <div className={`dot ${recording ? 'recording' : connected ? 'connected' : ''}`} />
           <span className="status-text">
-            {!connected ? 'disconnected' : status}
+            {vad.loading
+              ? "Loading models..."
+              : vad.errored
+              ? "Error loading VAD"
+              : status}
           </span>
+
           <div className="waveform">
-            {bars.map((h, i) => (
-              <div
-                key={i}
-                className={`bar ${recording ? 'rec' : ''}`}
-                style={{ height: h + 'px' }}
-              />
-            ))}
+            {Array(10)
+              .fill(0)
+              .map((_, i) => (
+                <div
+                  key={i}
+                  className="bar"
+                  style={{
+                    height: vad.userSpeaking
+                      ? `${15 + Math.random() * 20}px`
+                      : '3px',
+
+                    backgroundColor: vad.userSpeaking
+                      ? '#4ade80'
+                      : '#ccc',
+
+                    transition: 'height 0.1s ease',
+                  }}
+                />
+              ))}
           </div>
         </div>
 
-        <div className="footer-right">
-          <button className="btn btn-clear" onClick={clearAll}>Clear</button>
-          <button
-            className={`btn ${recording ? 'btn-stop' : 'btn-start'}`}
-            onClick={recording ? stopRecording : startRecording}
-            disabled={!connected}
-          >
-            {recording ? 'Stop' : 'Start Recording'}
-          </button>
-        </div>
+        <button
+          className={`btn ${
+            vad.listening ? 'btn-stop' : 'btn-start'
+          }`}
+          onClick={
+            vad.listening
+              ? stopTranscription
+              : startTranscription
+          }
+          disabled={vad.loading}
+        >
+          {vad.listening
+            ? 'Stop'
+            : 'Start Recording'}
+        </button>
       </footer>
     </div>
   );
