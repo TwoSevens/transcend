@@ -62,45 +62,6 @@ Transcend gives the user instant translated subtitles by:
 5. UI Layer (React)
 	- Displays source text, translated text, and session state.
 
-## 3-Day MVP Development Checklist
-
-This plan intentionally keeps scope minimal so a working MVP can ship in 3 days.
-
-### Day 1: Core Setup + Capture
-- [ ] Create React frontend with one screen: login, language selector, source selector, start/stop button.
-- [ ] Implement basic login (email magic link or single social provider).
-- [ ] Implement microphone capture first (required).
-- [ ] Add OS/system audio as best-effort toggle (fallback: show "coming soon" if not supported on platform/browser).
-- [ ] Send short audio chunks from frontend to backend.
-
-### Day 2: Transcribe + Translate Pipeline
-- [ ] Add backend endpoint/stream for receiving audio chunks.
-- [ ] Integrate Whisper for near-real-time transcription.
-- [ ] Integrate DeepL API for translation to selected comfort language.
-- [ ] Return transcript + translated text events to frontend.
-- [ ] Show rolling transcript feed in UI.
-
-### Day 3: Stabilize + Ship
-- [ ] Add basic error handling (API failure, no mic permission, empty audio).
-- [ ] Add lightweight reconnect/retry behavior.
-- [ ] Validate end-to-end flow: login -> select language/source -> start -> live output.
-- [ ] Run smoke tests on at least one desktop browser.
-- [ ] Deploy a demo environment with environment variables configured.
-
-### MVP Definition of Done
-- [ ] User can sign in.
-- [ ] User can select language of comfort.
-- [ ] User can choose at least microphone audio and start listening.
-- [ ] App displays live transcript and translated text with acceptable delay.
-- [ ] Demo URL is accessible and usable.
-
-### After MVP (Out of 3-Day Scope)
-- [ ] Full cross-platform OS audio capture support.
-- [ ] Transcript history/export.
-- [ ] Speaker diarization.
-- [ ] Detailed analytics/observability dashboard.
-- [ ] Comprehensive automated test suite.
-
 ## Suggested Environment Variables
 
 ```bash
@@ -117,7 +78,3 @@ NODE_ENV=development
 - Transcript accuracy by language/accent.
 - Translation quality score (user feedback).
 - Session stability (disconnects per hour).
-
-## License
-
-Add your preferred license (MIT, Apache-2.0, etc.) before release.
