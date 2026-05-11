@@ -11,6 +11,15 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
+// Serve built frontend (if present) for production deployments
+const distPath = path.join(__dirname, '../frontend/dist');
+if (fs.existsSync(distPath)) {
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+    });
+}
+
 // Use process.env (passed via terminal)
 const openai = new OpenAI({ apiKey: process.env.OPENAI_KEY });
 const translator = new deepl.Translator(process.env.DEEPL_KEY);
