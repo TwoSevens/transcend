@@ -3,17 +3,16 @@ require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { InferenceClient } = require('@huggingface/inference');
 const deepl = require('deepl-node');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = parseInt(process.env.PORT, 10) || 5000;
-const HF_TOKEN = process.env.HF_TOKEN;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const DEEPL_KEY = process.env.DEEPL_KEY;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'openai/whisper-large-v3-turbo';
 
-if (!HF_TOKEN) console.warn('[warn] HF_TOKEN not set — transcription will fail.');
+if (!GROQ_API_KEY) console.warn('[warn] GROQ_API_KEY not set — transcription will fail.');
 if (!DEEPL_KEY) console.warn('[warn] DEEPL_KEY not set — translation will fail.');
 
 const app = express();
@@ -35,7 +34,6 @@ if (fs.existsSync(distPath)) {
     });
 }
 
-const hf = new InferenceClient(HF_TOKEN);
 const translator = new deepl.Translator(DEEPL_KEY || 'missing');
 
 // DeepL accepts these target codes; map the simple UI codes to DeepL's expected form.
@@ -58,12 +56,25 @@ function resolveTarget(code) {
 }
 
 async function transcribe(buffer) {
-    const out = await hf.automaticSpeechRecognition({
-        data: buffer,
-        model: WHISPER_MODEL,
-        provider: 'auto',
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: 'audio/webm' }), 'audio.webm');
+    form.append('model', WHISPER_MODEL);
+
+    const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: form,
     });
-    return (out && out.text ? out.text : '').trim();
+
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`Groq API error ${response.status}: ${err}`);
+    }
+
+    const result = await response.json();
+    return (result.text || '').trim();
 }
 
 async function translate(text, target) {
