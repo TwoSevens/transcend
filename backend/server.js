@@ -74,19 +74,9 @@ function resolveTarget(code) {
 }
 
 /**
- * Returns true when the accumulated text ends with sentence-terminating
- * punctuation, optionally followed by closing quotes/brackets.
- * This is the trigger for immediate translation — no need to wait for the
- * client's 2-second silence timer.
- */
-function hasSentenceEnd(text) {
-    return /[.!?]['")\]]*\s*$/.test(text.trim());
-}
-
-/**
  * Transcribe an audio buffer via Groq Whisper.
- * `prompt` is the tail of the accumulated transcript — it seeds Whisper's
- * decoder so it doesn't hallucinate or break on short mid-sentence chunks.
+ * `prompt` seeds Whisper's decoder with the tail of the current sentence so
+ * it doesn't hallucinate or mis-capitalise mid-sentence chunks.
  */
 async function transcribe(buffer, prompt = '') {
     const form = new FormData();
@@ -120,28 +110,19 @@ io.on('connection', (socket) => {
     console.log('client connected:', socket.id);
 
     /**
-     * audio_chunk
+     * audio_chunk — Phase 1 only: transcribe and return.
      *
-     * Two-phase pipeline:
-     *
-     * Phase 1 — Transcription (fast, ~1-2 s):
-     *   Whisper returns the new chunk text. We emit `transcription_result`
-     *   immediately so the client can render it in the left panel right away,
-     *   shown dimmed since there's no translation yet.
-     *
-     * Phase 2 — Translation (triggered by sentence boundary):
-     *   If the accumulated text ends with . ! or ?, we translate the full
-     *   sentence and emit `translation_result`. The client uses this to fill
-     *   the right panel and bring the left panel to full opacity.
-     *   Sentences without terminal punctuation are handled by `finalize_segment`.
+     * Sentence detection and translation are now handled entirely on the
+     * client side.  When the client detects a sentence boundary in the
+     * accumulated text it calls `finalize_segment` directly.  This handler
+     * just runs Whisper and emits the new chunk text as fast as possible.
      */
     socket.on('audio_chunk', async (payload) => {
         try {
             const {
                 audio,
-                targetLang,
-                fullTranscript = '', // everything transcribed for this segment so far
-                prompt = '',         // last ~30 words for Whisper context
+                fullTranscript = '', // accumulated text so far (for Whisper context)
+                prompt = '',         // last ~30 words for Whisper decoder seeding
                 segmentId,
             } = payload || {};
 
@@ -150,35 +131,13 @@ io.on('connection', (socket) => {
             const buffer = Buffer.isBuffer(audio) ? audio : Buffer.from(audio);
             if (buffer.length < 1024) return;
 
-            // ── Phase 1 ──────────────────────────────────────────────────────
             const chunkTranscript = await transcribe(buffer, prompt || fullTranscript);
             if (!chunkTranscript) return;
 
-            const combined = fullTranscript
-                ? `${fullTranscript} ${chunkTranscript}`.trim()
-                : chunkTranscript;
-
-            const sentenceComplete = hasSentenceEnd(combined);
-
-            // Emit transcript immediately — client shows it dimmed.
             socket.emit('transcription_result', {
                 transcript: chunkTranscript,
                 segmentId,
-                sentenceComplete, // client seals the segment & opens new line if true
             });
-
-            // ── Phase 2 ──────────────────────────────────────────────────────
-            if (sentenceComplete) {
-                const target = resolveTarget(targetLang);
-                let translation = '';
-                try {
-                    translation = await translate(combined, target);
-                } catch (err) {
-                    console.error('translate error:', err.message);
-                    translation = '(translation failed)';
-                }
-                socket.emit('translation_result', { translation, segmentId });
-            }
         } catch (err) {
             console.error('processing error:', err.message);
             socket.emit('transcription_error', { message: err.message || 'processing failed' });
@@ -186,11 +145,12 @@ io.on('connection', (socket) => {
     });
 
     /**
-     * finalize_segment
+     * finalize_segment — translate a completed sentence (or a trailing
+     * fragment sealed by the silence timer) and emit the result.
      *
-     * The client fires this when its 2-second silence timer expires and the
-     * active segment still has no translation (speaker trailed off without a
-     * period / question mark).  We translate whatever text we're given.
+     * Called by the client in two situations:
+     *   1. A sentence boundary (. ! ?) was detected in the accumulated text.
+     *   2. The 2-second silence timer fired and there is still un-translated text.
      */
     socket.on('finalize_segment', async (payload) => {
         try {
