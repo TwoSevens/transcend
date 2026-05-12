@@ -400,3 +400,65 @@ body {
 @media (max-width: 720px) {
   .features { grid-template-columns: 1fr; }
 }
+
+/* ── transcript row animations (formerly injected from Transcribe.jsx) ── */
+
+.transcend-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: currentColor;
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  animation: transcend-blink 1s step-end infinite;
+}
+
+.transcend-spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.5;
+  margin-left: 6px;
+  vertical-align: middle;
+  animation: transcend-pulse 1s ease-in-out infinite;
+}
+
+@keyframes transcend-blink { 50% { opacity: 0; } }
+@keyframes transcend-pulse { 0%, 100% { opacity: 0.2; } 50% { opacity: 0.8; } }
+
+/* ── transient error banner ── */
+
+.banner {
+  background: rgba(248, 113, 113, 0.12);
+  color: var(--red);
+  border-bottom: 0.5px solid rgba(248, 113, 113, 0.4);
+  padding: 10px 24px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-align: center;
+}
+
+/* ── error boundary fallback ── */
+
+.error-fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  height: 100vh;
+  padding: 24px;
+  text-align: center;
+  font-family: var(--display);
+}
+.error-fallback pre {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 600px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
