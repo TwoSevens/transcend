@@ -49,12 +49,12 @@ export default function Home({ onStart }) {
         <div className="feature">
           <div className="feature-num">01</div>
           <h3>Capture</h3>
-          <p>The browser segments your microphone into 3-second chunks and streams them over WebSockets.</p>
+          <p>The browser detects speech with on-device VAD and streams each utterance over WebSockets.</p>
         </div>
         <div className="feature">
           <div className="feature-num">02</div>
           <h3>Transcribe</h3>
-          <p>Each chunk goes to Whisper via the Hugging Face Inference API for fast, accurate speech-to-text.</p>
+          <p>Each utterance goes to Whisper running on Groq for fast, accurate speech-to-text.</p>
         </div>
         <div className="feature">
           <div className="feature-num">03</div>
@@ -64,7 +64,7 @@ export default function Home({ onStart }) {
       </section>
 
       <footer className="home-foot">
-        <span>Built with React · Socket.io · Hugging Face · DeepL</span>
+        <span>Built with React · Socket.io · Groq · DeepL</span>
       </footer>
     </div>
   );
