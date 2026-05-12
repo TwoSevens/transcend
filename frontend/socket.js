@@ -5,8 +5,15 @@ const socket = io(
   {
     transports: ['websocket'],
     autoConnect: true,
-    reconnectionAttempts: 5,
-  }
+    // Retry indefinitely with capped exponential backoff. The UI surfaces
+    // disconnection state in the footer, so silent give-up is the wrong
+    // default.
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 5000,
+    randomizationFactor: 0.3,
+  },
 );
 
 export default socket;
