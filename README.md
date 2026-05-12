@@ -1,6 +1,6 @@
 # Transcend: Live Transcription and Translation
 
-Transcend is a streamlined web application designed to provide near real-time subtitles for spoken audio. It leverages the **Hugging Face Inference API** (Whisper) for speech-to-text and the **DeepL API** for high-fidelity translation, delivering a dual-language output to a React-based interface.
+Transcend is a streamlined web application designed to provide near real-time subtitles for spoken audio. It leverages the **GROQ Inference API** (Whisper) for speech-to-text and the **DeepL API** for high-fidelity translation, delivering a dual-language output to a React-based interface.
 
 ## System Architecture
 
@@ -8,7 +8,7 @@ The application operates as a continuous loop between the client and the server 
 
 1. **Client-Side Capture:** The browser uses the MediaRecorder API to segment microphone input into 3-second audio blobs.
 2. **Stream Transmission:** Each blob is shipped to the backend as a raw `ArrayBuffer` over a Socket.io WebSocket.
-3. **Transcription (Whisper via Hugging Face):** The Node.js server forwards the chunk to `@huggingface/inference` (`automaticSpeechRecognition`).
+3. **Transcription (Whisper via GROQ):** The Node.js server forwards the chunk to GROQ.
 4. **Translation (DeepL):** The transcript is translated into the user-selected target language.
 5. **UI Update:** The server emits `transcription_result` (`{ transcript, translation }`); the frontend renders both side-by-side.
 
@@ -17,7 +17,7 @@ The application operates as a continuous loop between the client and the server 
 - **Frontend:** React 19 + Vite
 - **Backend:** Node.js + Express 5
 - **Real-time:** Socket.io
-- **APIs:** Hugging Face Inference (Whisper) and DeepL
+- **APIs:** GROQ Inference (Whisper) and DeepL
 
 ## Project Structure
 
@@ -43,7 +43,7 @@ transcend/
 ```bash
 # 1. Backend
 cd backend
-cp .env.example .env       # fill in HF_TOKEN and DEEPL_KEY
+cp .env.example .env       # fill in GROQ_API_KEY and DEEPL_KEY
 npm install
 npm start
 
@@ -59,7 +59,7 @@ Open the printed Vite URL, click **Start transcribing**, and grant microphone ac
 ## Environment Variables
 
 **backend/.env**
-- `HF_TOKEN` — Hugging Face Inference API token
+- `GROQ_API_KEY` — Hugging Face Inference API token
 - `DEEPL_KEY` — DeepL API key
 - `WHISPER_MODEL` *(optional)* — defaults to `openai/whisper-large-v3-turbo`
 - `PORT` *(optional)* — defaults to `5000`
