@@ -280,13 +280,22 @@ export default function Transcribe({ onBack }) {
           </div>
         </div>
 
-        <button
-          className={`btn ${vad.listening ? 'btn-stop' : 'btn-start'}`}
-          onClick={vad.listening ? stopTranscription : startTranscription}
-          disabled={vad.loading}
-        >
-          {vad.listening ? 'Stop' : 'Start Recording'}
-        </button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            className="btn btn-clear"
+            onClick={() => setSegments([])}
+            disabled={vad.loading || segments.length === 0}
+          >
+            Clear
+          </button>
+          <button
+            className={`btn ${vad.listening ? 'btn-stop' : 'btn-start'}`}
+            onClick={vad.listening ? stopTranscription : startTranscription}
+            disabled={vad.loading}
+          >
+            {vad.listening ? 'Stop' : 'Start Recording'}
+          </button>
+        </div>
       </footer>
     </div>
   );
