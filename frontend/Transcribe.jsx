@@ -10,16 +10,42 @@ const getTimestamp = () =>
     second: '2-digit',
   });
 
-// After this much silence, finalize the active segment even without a period.
+// After this much silence, seal the trailing segment even without a period.
 const SENTENCE_SEAL_MS = 2000;
+
+/**
+ * Split accumulated text into complete sentences and a trailing fragment.
+ *
+ * e.g. "Hello world. How are you doing"
+ *   → { sentences: ["Hello world."], remaining: "How are you doing" }
+ */
+function extractSentences(text) {
+  const regex = /[^.!?]*[.!?]['")\]]*/g;
+  const sentences = [];
+  let lastIndex = 0;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    const s = match[0].trim();
+    if (s) sentences.push(s);
+    lastIndex = match.index + match[0].length;
+  }
+  return { sentences, remaining: text.slice(lastIndex).trim() };
+}
 
 /**
  * Segment status lifecycle:
  *
- *   'pending'     — transcript arrived, no translation yet (shown dimmed)
+ *   'pending'     — transcript arriving, no translation yet (shown dimmed)
  *   'translating' — sentence boundary detected or seal timer fired;
  *                   translation request in-flight (shown dimmed + spinner)
  *   'done'        — translation arrived (full opacity, right panel populated)
+ *
+ * Segment data shape:
+ *   { id, sessionId, transcript, translation, time, status, isFirstInSession }
+ *
+ * One "session" = one continuous VAD speech period → one timestamp group.
+ * Within a session, each completed sentence becomes its own sub-row.
+ * The timestamp is shown only on the first sub-row of each session.
  */
 
 export default function Transcribe({ onBack }) {
@@ -28,82 +54,165 @@ export default function Transcribe({ onBack }) {
 
   const targetLangRef = useRef('AR');
 
-  // ── Sentence grouping refs ───────────────────────────────────────────────
-  const activeSegmentIdRef = useRef(null); // ID of the line being built
-  const segmentsRef        = useRef([]);   // mirror of state for VAD callbacks
-  const sentenceTimerRef   = useRef(null); // seal timer
+  // ── Session / segment tracking ────────────────────────────────────────────
+  const activeSessionIdRef   = useRef(null); // current VAD session (new timestamp group)
+  const trailingSegmentIdRef = useRef(null); // the accumulating sub-row
+  const accumulatedTextRef   = useRef('');   // full text in the trailing sub-row
 
-  // Keep segmentsRef current so VAD callbacks don't read stale state.
+  const segmentsRef      = useRef([]);
+  const sentenceTimerRef = useRef(null);
+
+  // Keep segmentsRef in sync so event callbacks always see fresh data.
   useEffect(() => { segmentsRef.current = segments; }, [segments]);
 
-  // ── Helpers ──────────────────────────────────────────────────────────────
+  // ── Seal trailing segment (silence timeout or explicit stop) ─────────────
+  const sealTrailingSegment = () => {
+    const segmentId = trailingSegmentIdRef.current;
 
-  /** Read the accumulated transcript for a given segmentId from the ref. */
-  const getAccumulated = (segmentId) => {
-    const seg = segmentsRef.current.find(s => s.id === segmentId);
-    return seg?.transcript ?? '';
-  };
-
-  /**
-   * Seal the active segment:
-   *   - If it still has no translation, fire `finalize_segment` so the server
-   *     translates the hanging text (e.g. speaker stopped mid-sentence).
-   *   - Clear activeSegmentIdRef so the next chunk opens a new line.
-   */
-  const sealSegment = (segmentId) => {
-    const seg = segmentsRef.current.find(s => s.id === segmentId);
-    if (!seg) return;
-
-    if (seg.status !== 'done') {
-      // Mark as translating in the UI so the user sees a spinner.
-      setSegments(prev =>
-        prev.map(s => s.id === segmentId ? { ...s, status: 'translating' } : s)
-      );
-      socket.emit('finalize_segment', {
-        segmentId,
-        fullTranscript: seg.transcript,
-        targetLang: targetLangRef.current,
-      });
+    if (segmentId) {
+      const seg = segmentsRef.current.find(s => s.id === segmentId);
+      if (seg && seg.transcript && seg.status !== 'done') {
+        setSegments(prev =>
+          prev.map(s => s.id === segmentId ? { ...s, status: 'translating' } : s)
+        );
+        socket.emit('finalize_segment', {
+          segmentId,
+          fullTranscript: seg.transcript,
+          targetLang: targetLangRef.current,
+        });
+      }
     }
 
-    activeSegmentIdRef.current = null;
+    // Reset all session state — next VAD start will open a fresh session.
+    trailingSegmentIdRef.current = null;
+    activeSessionIdRef.current   = null;
+    accumulatedTextRef.current   = '';
+  };
+
+  // ── Sentence boundary processing ─────────────────────────────────────────
+  /**
+   * Called after every transcription chunk is appended to accumulatedTextRef.
+   * If one or more complete sentences exist in the accumulated text:
+   *   - Each sentence becomes its own sub-row (status: 'translating')
+   *   - A translation is requested for each via finalize_segment
+   *   - The leftover fragment (if any) stays as the new trailing sub-row
+   */
+  const processSentenceBoundaries = (trailingId) => {
+    const { sentences, remaining } = extractSentences(accumulatedTextRef.current);
+    if (sentences.length === 0) return; // nothing to seal yet
+
+    const sessionId = activeSessionIdRef.current;
+    const now       = Date.now();
+
+    // Pre-generate all IDs before any state mutation so both setSegments
+    // and socket.emit reference exactly the same values.
+    const completedIds  = sentences.map((_, i) => i === 0 ? trailingId : `seg-${now}-c${i}`);
+    const newTrailingId = remaining ? `seg-${now}-trail` : null;
+
+    // Update refs synchronously — must happen before setSegments so that
+    // any incoming transcription_result routes to the correct target.
+    accumulatedTextRef.current   = remaining;
+    trailingSegmentIdRef.current = newTrailingId;
+
+    setSegments(prev => {
+      const idx = prev.findIndex(s => s.id === trailingId);
+      if (idx === -1) return prev;
+
+      const origin = prev[idx]; // the trailing sub-row being split
+
+      // One sub-row per completed sentence.
+      const completedSegs = sentences.map((text, i) => ({
+        ...origin,
+        id: completedIds[i],
+        transcript: text,
+        translation: '',
+        status: 'translating',
+        // Only the very first sub-row of the session carries the timestamp.
+        isFirstInSession: i === 0 ? origin.isFirstInSession : false,
+      }));
+
+      const insertions = [...completedSegs];
+
+      // Append a fresh trailing sub-row for the remaining fragment.
+      if (newTrailingId) {
+        insertions.push({
+          id: newTrailingId,
+          sessionId,
+          transcript: remaining,
+          translation: '',
+          time: getTimestamp(),
+          status: 'pending',
+          isFirstInSession: false,
+        });
+      }
+
+      const next = [...prev];
+      next.splice(idx, 1, ...insertions);
+      return next;
+    });
+
+    // Request a translation for each sealed sentence.
+    completedIds.forEach((segId, i) => {
+      socket.emit('finalize_segment', {
+        segmentId:    segId,
+        fullTranscript: sentences[i],
+        targetLang:   targetLangRef.current,
+      });
+    });
   };
 
   // ── Chunk sender (called by VAD onSpeechEnd) ─────────────────────────────
-
   const sendChunk = (audio) => {
     setStatus('transcribing...');
 
-    // Reuse or create the active segment.
-    if (!activeSegmentIdRef.current) {
-      activeSegmentIdRef.current = `seg-${Date.now()}`;
+    // Ensure a session exists.
+    const sessionId = activeSessionIdRef.current ?? `session-${Date.now()}`;
+    activeSessionIdRef.current = sessionId;
+
+    // Create a trailing sub-row if none exists for this session.
+    if (!trailingSegmentIdRef.current) {
+      const newId = `seg-${Date.now()}`;
+      trailingSegmentIdRef.current = newId;
+
+      setSegments(prev => [
+        ...prev,
+        {
+          id: newId,
+          sessionId,
+          transcript: '',
+          translation: '',
+          time: getTimestamp(),
+          status: 'pending',
+          // First sub-row of this session if no prior segments share the sessionId.
+          isFirstInSession: !prev.some(s => s.sessionId === sessionId),
+        },
+      ]);
     }
-    const segmentId   = activeSegmentIdRef.current;
-    const accumulated = getAccumulated(segmentId);
-    const prompt      = accumulated.split(' ').slice(-30).join(' ');
+
+    const segmentId = trailingSegmentIdRef.current;
+    const prompt    = accumulatedTextRef.current.split(' ').slice(-30).join(' ');
 
     socket.emit('audio_chunk', {
-      audio: utils.encodeWAV(audio),
-      mimeType: 'audio/wav',
-      targetLang: targetLangRef.current,
+      audio:        utils.encodeWAV(audio),
+      mimeType:     'audio/wav',
+      targetLang:   targetLangRef.current,
       segmentId,
-      fullTranscript: accumulated,
+      fullTranscript: accumulatedTextRef.current,
       prompt,
     });
 
-    // Reset silence timer — each new chunk extends the current sentence.
+    // Silence timer: seal the trailing sub-row if no new speech arrives.
     clearTimeout(sentenceTimerRef.current);
     sentenceTimerRef.current = setTimeout(() => {
-      sealSegment(segmentId);
+      sealTrailingSegment();
       setStatus('waiting for speech...');
     }, SENTENCE_SEAL_MS);
   };
 
   // ── VAD ──────────────────────────────────────────────────────────────────
-
   const vad = useMicVAD({
-    onnxWASMBasePath: "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/",
-    baseAssetPath:   "https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/",
+    onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+    baseAssetPath:   'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.27/dist/',
     startOnRealize: false,
 
     positiveSpeechThreshold: 0.6,
@@ -112,13 +221,18 @@ export default function Transcribe({ onBack }) {
     preSpeechPadFrames: 8,
     minSpeechFrames: 3,
 
-    onSpeechStart: () => setStatus('listening...'),
-    onSpeechEnd:   (audio) => sendChunk(audio),
-    onVADMisfire:  () => setStatus('waiting for speech...'),
+    onSpeechStart: () => {
+      // Open a new session on the first speech of a silence → speech transition.
+      if (!activeSessionIdRef.current) {
+        activeSessionIdRef.current = `session-${Date.now()}`;
+      }
+      setStatus('listening...');
+    },
+    onSpeechEnd:  (audio) => sendChunk(audio),
+    onVADMisfire: () => setStatus('waiting for speech...'),
   });
 
   // ── Controls ─────────────────────────────────────────────────────────────
-
   const startTranscription = () => {
     vad.start();
     setStatus('waiting for speech...');
@@ -127,73 +241,75 @@ export default function Transcribe({ onBack }) {
   const stopTranscription = () => {
     vad.pause();
     clearTimeout(sentenceTimerRef.current);
-    if (activeSegmentIdRef.current) {
-      sealSegment(activeSegmentIdRef.current);
-    }
+    sealTrailingSegment();
     setStatus('idle');
   };
 
   // ── Socket events ─────────────────────────────────────────────────────────
-
   useEffect(() => {
     /**
-     * transcription_result — Phase 1.
-     * Append the new chunk text to the segment. Show it immediately, dimmed.
-     * If `sentenceComplete`, seal the segment right away (don't wait for the
-     * 2s timer) — the next chunk will be a fresh line.
+     * transcription_result — a new text chunk from Whisper.
+     *
+     * The segmentId echoed back by the server may be stale if
+     * processSentenceBoundaries already sealed that sub-row by the time
+     * this response arrives.  In that case we re-route to the current
+     * trailing sub-row (creating one if needed) rather than discarding.
      */
-    const onTranscript = ({ transcript, segmentId, sentenceComplete }) => {
-      setSegments(prev => {
-        const exists = prev.some(s => s.id === segmentId);
+    const onTranscript = ({ transcript, segmentId }) => {
+      const seg = segmentsRef.current.find(s => s.id === segmentId);
+      const isCurrentTrailing =
+        seg?.status === 'pending' && segmentId === trailingSegmentIdRef.current;
 
-        if (exists) {
-          return prev.map(s =>
-            s.id === segmentId
-              ? {
-                  ...s,
-                  transcript: `${s.transcript} ${transcript}`.trim(),
-                  // If a sentence boundary was detected, move to 'translating'
-                  // so the spinner shows while we wait for translation_result.
-                  status: sentenceComplete ? 'translating' : s.status,
-                }
-              : s
-          );
+      let targetId = segmentId;
+
+      if (!isCurrentTrailing) {
+        // The segment is sealed or unknown — route to the current trailing.
+        if (!trailingSegmentIdRef.current) {
+          const sessionId = activeSessionIdRef.current;
+          if (!sessionId) return; // session fully over; discard safely
+
+          const newId = `seg-${Date.now()}-ov`;
+          trailingSegmentIdRef.current = newId;
+
+          setSegments(prev => [
+            ...prev,
+            {
+              id: newId,
+              sessionId,
+              transcript: '',
+              translation: '',
+              time: getTimestamp(),
+              status: 'pending',
+              isFirstInSession: false,
+            },
+          ]);
         }
-
-        // First chunk for this segment.
-        return [
-          ...prev,
-          {
-            id: segmentId,
-            transcript,
-            translation: '',
-            time: getTimestamp(),
-            status: sentenceComplete ? 'translating' : 'pending',
-          },
-        ];
-      });
-
-      // Seal immediately on sentence boundary so next speech starts fresh.
-      if (sentenceComplete) {
-        clearTimeout(sentenceTimerRef.current);
-        activeSegmentIdRef.current = null;
+        targetId = trailingSegmentIdRef.current;
       }
 
-      setStatus(sentenceComplete ? 'waiting for speech...' : 'listening...');
+      // Append chunk to accumulated text.
+      const newAccumulated = accumulatedTextRef.current
+        ? `${accumulatedTextRef.current} ${transcript}`.trim()
+        : transcript;
+      accumulatedTextRef.current = newAccumulated;
+
+      // Show the updated text in the trailing sub-row (dimmed).
+      setSegments(prev =>
+        prev.map(s => s.id === targetId ? { ...s, transcript: newAccumulated } : s)
+      );
+
+      // Check if any complete sentences have appeared.
+      processSentenceBoundaries(targetId);
+
+      setStatus('listening...');
     };
 
     /**
-     * translation_result — Phase 2.
-     * The translation is ready — bring the segment to full opacity and
-     * populate the right panel.
+     * translation_result — bring a sub-row to full opacity.
      */
     const onTranslation = ({ translation, segmentId }) => {
       setSegments(prev =>
-        prev.map(s =>
-          s.id === segmentId
-            ? { ...s, translation, status: 'done' }
-            : s
-        )
+        prev.map(s => s.id === segmentId ? { ...s, translation, status: 'done' } : s)
       );
     };
 
@@ -215,7 +331,6 @@ export default function Transcribe({ onBack }) {
   }, []);
 
   // ── Render ────────────────────────────────────────────────────────────────
-
   return (
     <div className="app">
       <header className="header">
@@ -303,31 +418,30 @@ export default function Transcribe({ onBack }) {
 
 // ─── SegmentRow ───────────────────────────────────────────────────────────────
 //
-// Renders one line in either panel.
+// Renders one sub-row in either panel.
 //
-// Visual contract:
-//   pending     → text at 35% opacity (transcript visible, no translation yet)
-//   translating → text at 35% opacity + small spinning dot (translation in-flight)
-//   done        → text at full opacity, translation visible
-//
-// The opacity lives on the <p> so the timestamp stays readable at all times.
+// isFirstInSession → timestamp is visible; all continuation rows reserve the
+// same space but hide it, keeping text alignment consistent across the panel.
 
 function SegmentRow({ segment, field }) {
-  const { status, time } = segment;
+  const { status, time, isFirstInSession } = segment;
   const text = segment[field];
 
-  const isPending     = status === 'pending';
-  const isTranslating = status === 'translating';
   const isDone        = status === 'done';
+  const isTranslating = status === 'translating';
 
-  // Right panel: show a placeholder while translating so the row doesn't collapse.
-  const displayText = field === 'translation' && !isDone
-    ? ''
-    : text;
+  // Right panel: show nothing while waiting for translation.
+  const displayText = field === 'translation' && !isDone ? '' : text;
 
   return (
     <div className="segment" style={{ position: 'relative' }}>
-      <span className="seg-time">{time}</span>
+      {/* Always rendered for layout; hidden on continuation rows. */}
+      <span
+        className="seg-time"
+        style={{ visibility: isFirstInSession ? 'visible' : 'hidden' }}
+      >
+        {time}
+      </span>
 
       <p style={{
         opacity:    isDone ? 1 : 0.35,
@@ -336,13 +450,13 @@ function SegmentRow({ segment, field }) {
       }}>
         {displayText}
 
-        {/* Blinking cursor while new words may still arrive */}
+        {/* Blinking cursor on the trailing sub-row */}
         {field === 'transcript' && !isDone && (
           <span style={cursorStyle} aria-hidden="true" />
         )}
       </p>
 
-      {/* Spinning dot on the right panel while translation is in-flight */}
+      {/* Spinning dot on right panel while translation is in-flight */}
       {field === 'translation' && isTranslating && (
         <span style={spinnerStyle} aria-label="translating…" />
       )}
@@ -350,32 +464,30 @@ function SegmentRow({ segment, field }) {
   );
 }
 
-// ── Inline style objects (avoids needing new CSS classes) ──────────────────
+// ── Inline styles ─────────────────────────────────────────────────────────────
 
 const cursorStyle = {
-  display:         'inline-block',
-  width:           '2px',
-  height:          '1em',
-  background:      'currentColor',
-  marginLeft:      '3px',
-  verticalAlign:   'text-bottom',
-  animation:       'transcend-blink 1s step-end infinite',
+  display:       'inline-block',
+  width:         '2px',
+  height:        '1em',
+  background:    'currentColor',
+  marginLeft:    '3px',
+  verticalAlign: 'text-bottom',
+  animation:     'transcend-blink 1s step-end infinite',
 };
 
 const spinnerStyle = {
-  display:      'inline-block',
-  width:        '8px',
-  height:       '8px',
-  borderRadius: '50%',
-  background:   'currentColor',
-  opacity:      0.5,
-  animation:    'transcend-pulse 1s ease-in-out infinite',
-  marginLeft:   '6px',
+  display:       'inline-block',
+  width:         '8px',
+  height:        '8px',
+  borderRadius:  '50%',
+  background:    'currentColor',
+  opacity:       0.5,
+  animation:     'transcend-pulse 1s ease-in-out infinite',
+  marginLeft:    '6px',
   verticalAlign: 'middle',
 };
 
-// Inject the keyframes once into the document head.
-// This keeps the component self-contained without touching the global CSS file.
 if (typeof document !== 'undefined') {
   const styleId = 'transcend-keyframes';
   if (!document.getElementById(styleId)) {
