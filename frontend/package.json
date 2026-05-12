@@ -1,17 +1,25 @@
 {
-  "name": "frontend",
+  "name": "transcend-frontend",
   "version": "1.0.0",
-  "description": "",
+  "description": "React UI for the Transcend live transcription + translation app.",
   "scripts": {
     "start": "vite",
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview"
   },
-  "keywords": [],
+  "keywords": [
+    "transcription",
+    "translation",
+    "react",
+    "vite"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@ricky0123/vad-react": "^0.0.30",
+    "@ricky0123/vad-web": "^0.0.27",
+    "onnxruntime-web": "^1.22.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "socket.io-client": "^4.8.3"
