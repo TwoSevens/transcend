@@ -39,6 +39,7 @@ const LIMITS = {
     AUDIO_CHUNKS_PER_WINDOW: 20,        // rate limit: chunks per socket
     FINALIZE_PER_WINDOW: 10,            // rate limit: finalize calls per socket
     RATE_WINDOW_MS: 10_000,             // sliding window for rate limits
+    COMPLETED_CACHE_SIZE: 500,          // per-socket idempotency cache
 };
 
 const RETRY = {
@@ -48,12 +49,29 @@ const RETRY = {
     TIMEOUT_MS: 30_000,                 // per-attempt timeout
 };
 
+// ─── CORS origin (env-driven) ───────────────────────────────────────────────
+//
+// ALLOWED_ORIGIN may be:
+//   - a single origin: "https://example.com"
+//   - a comma-separated list: "https://a.com,https://b.com"
+//   - "*" to allow all (dev default)
+// In production, if unset, fall back to no origin (refuse) rather than "*".
+
+function parseAllowedOrigin(value, isProduction) {
+    if (!value) return isProduction ? false : '*';
+    if (value === '*') return '*';
+    const list = value.split(',').map((s) => s.trim()).filter(Boolean);
+    return list.length === 1 ? list[0] : list;
+}
+
+const ALLOWED_ORIGIN = parseAllowedOrigin(process.env.ALLOWED_ORIGIN, NODE_ENV === 'production');
+
 // ─── App / server setup ─────────────────────────────────────────────────────
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: '*' },
+    cors: { origin: ALLOWED_ORIGIN },
     maxHttpBufferSize: LIMITS.MAX_AUDIO_BYTES + 64 * 1024, // headroom for envelope
 });
 
@@ -86,7 +104,7 @@ const DEEPL_TARGET = {
 };
 
 // Lazily-loaded set of valid DeepL target codes (lowercased) from the SDK.
-// We fetch once and reuse; if the call fails we fall back to the static map.
+// Fetched once and reused; if the call fails we fall back to the static map.
 let validDeepLTargets = null;
 let validDeepLTargetsPromise = null;
 
@@ -231,6 +249,29 @@ function makeRateLimiter(limit, windowMs) {
     };
 }
 
+// ─── Per-socket idempotency cache ───────────────────────────────────────────
+//
+// finalize_segment may be retried by the client (reconnect, transient error).
+// We cache (segmentId → translation) per socket so retries return the same
+// answer rather than re-billing DeepL with potentially divergent output.
+// Uses Map insertion order for cheap LRU eviction.
+
+function makeCompletedCache(maxSize) {
+    const map = new Map();
+    return {
+        has: (key) => map.has(key),
+        get: (key) => map.get(key),
+        set: (key, value) => {
+            if (map.has(key)) map.delete(key);
+            map.set(key, value);
+            while (map.size > maxSize) {
+                const oldest = map.keys().next().value;
+                map.delete(oldest);
+            }
+        },
+    };
+}
+
 // ─── Validation helpers ─────────────────────────────────────────────────────
 
 function clampString(value, max) {
@@ -256,6 +297,7 @@ io.on('connection', (socket) => {
 
     const allowAudio = makeRateLimiter(LIMITS.AUDIO_CHUNKS_PER_WINDOW, LIMITS.RATE_WINDOW_MS);
     const allowFinalize = makeRateLimiter(LIMITS.FINALIZE_PER_WINDOW, LIMITS.RATE_WINDOW_MS);
+    const completed = makeCompletedCache(LIMITS.COMPLETED_CACHE_SIZE);
 
     /**
      * audio_chunk — Phase 1 only: transcribe and return.
@@ -323,12 +365,23 @@ io.on('connection', (socket) => {
      * finalize_segment — translate a completed sentence (or trailing fragment
      * sealed by the silence timer) and emit the result.
      *
-     * Errors are surfaced to the client with a code so it can decide whether
-     * to retry, fall back, or show the user a message.
+     * Idempotent: a second call with the same segmentId replays the cached
+     * translation rather than re-querying DeepL.
      */
     socket.on('finalize_segment', async (payload) => {
         const segmentId = payload?.segmentId;
         try {
+            if (!segmentId) return;
+
+            // Idempotency check before any rate-limit / validation work.
+            if (completed.has(segmentId)) {
+                socket.emit('translation_result', {
+                    translation: completed.get(segmentId),
+                    segmentId,
+                });
+                return;
+            }
+
             if (!allowFinalize()) {
                 socket.emit('translation_error', {
                     message: 'Rate limit exceeded for finalize_segment',
@@ -339,7 +392,7 @@ io.on('connection', (socket) => {
             }
 
             const { fullTranscript, targetLang } = payload || {};
-            if (!segmentId || !fullTranscript) return;
+            if (!fullTranscript) return;
 
             const text = clampString(fullTranscript, LIMITS.MAX_TRANSCRIPT_CHARS);
 
@@ -357,6 +410,7 @@ io.on('connection', (socket) => {
 
             try {
                 const translation = await translate(text, target);
+                completed.set(segmentId, translation);
                 socket.emit('translation_result', { translation, segmentId });
             } catch (err) {
                 console.error('finalize translate error:', err.message);
