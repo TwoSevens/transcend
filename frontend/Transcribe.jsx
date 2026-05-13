@@ -108,6 +108,10 @@ export default function Transcribe({ onBack }) {
 
   const targetLangRef = useRef('AR');
 
+  // ── Panel scroll refs ─────────────────────────────────────────────────────
+  const transcriptPanelRef  = useRef(null);
+  const translationPanelRef = useRef(null);
+
   // ── Session / segment tracking ────────────────────────────────────────────
   const activeSessionIdRef   = useRef(null); // current VAD session (timestamp group)
   const trailingSegmentIdRef = useRef(null); // the accumulating sub-row
@@ -119,6 +123,16 @@ export default function Transcribe({ onBack }) {
 
   // Keep segmentsRef in sync so event callbacks always see fresh data.
   useEffect(() => { segmentsRef.current = segments; }, [segments]);
+
+  // ── Auto-scroll both panels to the bottom on every segments update ────────
+  useEffect(() => {
+    if (transcriptPanelRef.current) {
+      transcriptPanelRef.current.scrollTop = transcriptPanelRef.current.scrollHeight;
+    }
+    if (translationPanelRef.current) {
+      translationPanelRef.current.scrollTop = translationPanelRef.current.scrollHeight;
+    }
+  }, [segments]);
 
   // ── Append a segment list update with soft cap enforcement ───────────────
   const updateSegments = (updater) => {
@@ -476,7 +490,7 @@ export default function Transcribe({ onBack }) {
       <main className="panels">
         <div className="panel">
           <div className="panel-header">Transcript</div>
-          <div className="panel-scroll">
+          <div className="panel-scroll" ref={transcriptPanelRef}>
             {segments.map((s) => (
               <SegmentRow key={s.id} segment={s} field="transcript" />
             ))}
@@ -485,7 +499,7 @@ export default function Transcribe({ onBack }) {
 
         <div className="panel">
           <div className="panel-header">Translation</div>
-          <div className="panel-scroll">
+          <div className="panel-scroll" ref={translationPanelRef}>
             {segments.map((s) => (
               <SegmentRow key={s.id} segment={s} field="translation" />
             ))}
